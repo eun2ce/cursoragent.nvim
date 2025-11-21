@@ -1,5 +1,16 @@
 local M = {}
 
+---Normalizes focus parameter to default to true for backward compatibility
+---@param focus boolean? The focus parameter
+---@return boolean valid Whether the focus parameter is valid
+function M.normalize_focus(focus)
+  if focus == nil then
+    return true
+  else
+    return focus
+  end
+end
+
 function M.is_list(value)
   return type(value) == "table" and (#value > 0 or next(value) ~= nil)
 end

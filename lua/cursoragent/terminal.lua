@@ -1,342 +1,584 @@
----@mod cursoragent.terminal Terminal management for cursoragent.nvim
----@brief [[
---- This module provides terminal buffer management for cursoragent.nvim.
---- It handles creating, toggling, and managing terminal windows with multi-instance support.
----@brief ]]
+--- Module to manage a dedicated vertical split terminal for Cursor Agent.
+--- Supports Snacks.nvim or a native Neovim terminal fallback.
+--- @module 'cursoragent.terminal'
 
 local M = {}
 
----Terminal buffer and window management
----@table CursorAgentTerminal
----@field instances table<string, number> Key-value store of instance ID to buffer number
----@field saved_updatetime number|nil Original updatetime before cursoragent was opened
----@field current_instance string|nil Current instance identifier
-M.terminal = {
-  instances = {},
-  saved_updatetime = nil,
-  current_instance = nil,
+-- Lazy require to avoid circular dependency
+local function get_server_module()
+  return require("cursoragent.server.init")
+end
+
+---@type CursorAgentTerminalConfig
+local defaults = {
+  split_side = "right",
+  split_width_percentage = 0.30,
+  provider = "auto",
+  show_native_term_exit_tip = true,
+  terminal_cmd = nil,
+  provider_opts = {
+    external_terminal_cmd = nil,
+  },
+  auto_close = true,
+  env = {},
+  snacks_win_opts = {},
+  -- Working directory control
+  cwd = nil, -- static cwd override
+  git_repo_cwd = false, -- resolve to git root when spawning
+  cwd_provider = nil, -- function(ctx) -> cwd string
 }
 
----Get instance identifier (git root or cwd)
----@param git table The git module
----@param config table Plugin configuration
----@return string identifier Instance identifier
-local function get_instance_identifier(git, config)
-  if config.git.multi_instance then
-    if config.git.use_git_root then
-      local git_root = git.get_git_root()
-      if git_root then
-        return git_root
-      end
-    end
-    return vim.fn.getcwd()
-  else
-    return 'global'
-  end
-end
+M.defaults = defaults
 
----Calculate floating window dimensions from percentage strings
----@param value number|string Dimension value (number or percentage string)
----@param max_value number Maximum value (columns or lines)
----@return number Calculated dimension
-local function calculate_float_dimension(value, max_value)
-  if value == nil then
-    return math.floor(max_value * 0.8)
-  elseif type(value) == 'string' and value:match('^%d+%%$') then
-    local percentage = tonumber(value:match('^(%d+)%%$'))
-    return math.floor(max_value * percentage / 100)
-  end
-  return value
-end
+-- Lazy load providers
+local providers = {}
 
----Calculate floating window position
----@param value number|string Position value (number, "center", or percentage)
----@param window_size number Size of the window
----@param max_value number Maximum value (columns or lines)
----@return number Calculated position
-local function calculate_float_position(value, window_size, max_value)
-  local pos
-  if value == 'center' then
-    pos = math.floor((max_value - window_size) / 2)
-  elseif type(value) == 'string' and value:match('^%d+%%$') then
-    local percentage = tonumber(value:match('^(%d+)%%$'))
-    pos = math.floor(max_value * percentage / 100)
-  else
-    pos = value or 0
-  end
-  return math.max(0, math.min(pos, max_value - window_size))
-end
-
----Create a floating window
----@param config table Plugin configuration
----@param existing_bufnr number|nil Existing buffer number
----@return number win_id Window ID
-local function create_float(config, existing_bufnr)
-  local float_config = config.window.float or {}
-  
-  local editor_width = vim.o.columns
-  local editor_height = vim.o.lines - vim.o.cmdheight - 1
-  
-  local width = calculate_float_dimension(float_config.width, editor_width)
-  local height = calculate_float_dimension(float_config.height, editor_height)
-  
-  local row = calculate_float_position(float_config.row, height, editor_height)
-  local col = calculate_float_position(float_config.col, width, editor_width)
-  
-  local win_config = {
-    relative = float_config.relative or 'editor',
-    width = width,
-    height = height,
-    row = row,
-    col = col,
-    border = float_config.border or 'rounded',
-    style = 'minimal',
-  }
-  
-  local bufnr = existing_bufnr
-  if not bufnr then
-    bufnr = vim.api.nvim_create_buf(false, true)
-  else
-    if not vim.api.nvim_buf_is_valid(bufnr) then
-      bufnr = vim.api.nvim_create_buf(false, true)
+---Loads a terminal provider module
+---@param provider_name string The name of the provider to load
+---@return CursorAgentTerminalProvider? provider The provider module, or nil if loading failed
+local function load_provider(provider_name)
+  if not providers[provider_name] then
+    local ok, provider = pcall(require, "cursoragent.terminal." .. provider_name)
+    if ok then
+      providers[provider_name] = provider
     else
-      local buftype = vim.api.nvim_get_option_value('buftype', {buf = bufnr})
-      if buftype ~= 'terminal' then
-        bufnr = vim.api.nvim_create_buf(false, true)
+      return nil
+    end
+  end
+  return providers[provider_name]
+end
+
+---Validates and enhances a custom table provider with smart defaults
+---@param provider CursorAgentTerminalProvider The custom provider table to validate
+---@return CursorAgentTerminalProvider? provider The enhanced provider, or nil if invalid
+---@return string? error Error message if validation failed
+local function validate_and_enhance_provider(provider)
+  if type(provider) ~= "table" then
+    return nil, "Custom provider must be a table"
+  end
+
+  -- Required functions that must be implemented
+  local required_functions = {
+    "setup",
+    "open",
+    "close",
+    "simple_toggle",
+    "focus_toggle",
+    "get_active_bufnr",
+    "is_available",
+  }
+
+  -- Validate all required functions exist and are callable
+  for _, func_name in ipairs(required_functions) do
+    local func = provider[func_name]
+    if not func then
+      return nil, "Custom provider missing required function: " .. func_name
+    end
+    -- Check if it's callable (function or table with __call metamethod)
+    local is_callable = type(func) == "function"
+      or (type(func) == "table" and getmetatable(func) and getmetatable(func).__call)
+    if not is_callable then
+      return nil, "Custom provider field '" .. func_name .. "' must be callable, got: " .. type(func)
+    end
+  end
+
+  -- Create enhanced provider with defaults for optional functions
+  -- Note: Don't deep copy to preserve spy functions in tests
+  local enhanced_provider = provider
+
+  -- Add default toggle function if not provided (calls simple_toggle for backward compatibility)
+  if not enhanced_provider.toggle then
+    enhanced_provider.toggle = function(cmd_string, env_table, effective_config)
+      return enhanced_provider.simple_toggle(cmd_string, env_table, effective_config)
+    end
+  end
+
+  -- Add default test function if not provided
+  if not enhanced_provider._get_terminal_for_test then
+    enhanced_provider._get_terminal_for_test = function()
+      return nil
+    end
+  end
+
+  return enhanced_provider, nil
+end
+
+---Gets the effective terminal provider, guaranteed to return a valid provider
+---Falls back to native provider if configured provider is unavailable
+---@return CursorAgentTerminalProvider provider The terminal provider module (never nil)
+local function get_provider()
+  local logger = require("cursoragent.logger")
+
+  -- Handle custom table provider
+  if type(defaults.provider) == "table" then
+    local custom_provider = defaults.provider --[[@as CursorAgentTerminalProvider]]
+    local enhanced_provider, error_msg = validate_and_enhance_provider(custom_provider)
+    if enhanced_provider then
+      -- Check if custom provider is available
+      local is_available_ok, is_available = pcall(enhanced_provider.is_available)
+      if is_available_ok and is_available then
+        logger.debug("terminal", "Using custom table provider")
+        return enhanced_provider
+      else
+        local availability_msg = is_available_ok and "provider reports not available" or "error checking availability"
+        logger.warn(
+          "terminal",
+          "Custom table provider configured but " .. availability_msg .. ". Falling back to 'native'."
+        )
+      end
+    else
+      logger.warn("terminal", "Invalid custom table provider: " .. error_msg .. ". Falling back to 'native'.")
+    end
+    -- Fall through to native provider
+  elseif defaults.provider == "auto" then
+    -- Try snacks first, then fallback to native silently
+    local snacks_provider = load_provider("snacks")
+    if snacks_provider and snacks_provider.is_available() then
+      return snacks_provider
+    end
+    -- Fall through to native provider
+  elseif defaults.provider == "snacks" then
+    local snacks_provider = load_provider("snacks")
+    if snacks_provider and snacks_provider.is_available() then
+      return snacks_provider
+    else
+      logger.warn("terminal", "'snacks' provider configured, but Snacks.nvim not available. Falling back to 'native'.")
+    end
+  elseif defaults.provider == "external" then
+    local external_provider = load_provider("external")
+    if external_provider then
+      -- Check availability based on our config instead of provider's internal state
+      local external_cmd = defaults.provider_opts and defaults.provider_opts.external_terminal_cmd
+
+      local has_external_cmd = false
+      if type(external_cmd) == "function" then
+        has_external_cmd = true
+      elseif type(external_cmd) == "string" and external_cmd ~= "" and external_cmd:find("%%s") then
+        has_external_cmd = true
+      end
+
+      if has_external_cmd then
+        return external_provider
+      else
+        logger.warn(
+          "terminal",
+          "'external' provider configured, but provider_opts.external_terminal_cmd not properly set. Falling back to 'native'."
+        )
+      end
+    end
+  elseif defaults.provider == "native" then
+    -- noop, will use native provider as default below
+    logger.debug("terminal", "Using native terminal provider")
+  elseif defaults.provider == "none" then
+    local none_provider = load_provider("none")
+    if none_provider then
+      logger.debug("terminal", "Using no-op terminal provider ('none')")
+      return none_provider
+    else
+      logger.warn("terminal", "'none' provider configured but failed to load. Falling back to 'native'.")
+    end
+  elseif type(defaults.provider) == "string" then
+    logger.warn(
+      "terminal",
+      "Invalid provider configured: " .. tostring(defaults.provider) .. ". Defaulting to 'native'."
+    )
+  else
+    logger.warn(
+      "terminal",
+      "Invalid provider type: " .. type(defaults.provider) .. ". Must be string or table. Defaulting to 'native'."
+    )
+  end
+
+  local native_provider = load_provider("native")
+  if not native_provider then
+    error("CursorAgent: Critical error - native terminal provider failed to load")
+  end
+  return native_provider
+end
+
+---Builds the effective terminal configuration by merging defaults with overrides
+---@param opts_override table? Optional overrides for terminal appearance
+---@return table config The effective terminal configuration
+local function build_config(opts_override)
+  local effective_config = vim.deepcopy(defaults)
+  if type(opts_override) == "table" then
+    local validators = {
+      split_side = function(val)
+        return val == "left" or val == "right"
+      end,
+      split_width_percentage = function(val)
+        return type(val) == "number" and val > 0 and val < 1
+      end,
+      snacks_win_opts = function(val)
+        return type(val) == "table"
+      end,
+      cwd = function(val)
+        return val == nil or type(val) == "string"
+      end,
+      git_repo_cwd = function(val)
+        return type(val) == "boolean"
+      end,
+      cwd_provider = function(val)
+        local t = type(val)
+        if t == "function" then
+          return true
+        end
+        if t == "table" then
+          local mt = getmetatable(val)
+          return mt and mt.__call ~= nil
+        end
+        return false
+      end,
+    }
+    for key, val in pairs(opts_override) do
+      if effective_config[key] ~= nil and validators[key] and validators[key](val) then
+        effective_config[key] = val
       end
     end
   end
-  
-  return vim.api.nvim_open_win(bufnr, true, win_config)
-end
+  -- Resolve cwd at config-build time so providers receive it directly
+  local cwd_ctx = {
+    file = (function()
+      local path = vim.fn.expand("%:p")
+      if type(path) == "string" and path ~= "" then
+        return path
+      end
+      return nil
+    end)(),
+    cwd = vim.fn.getcwd(),
+  }
+  cwd_ctx.file_dir = cwd_ctx.file and vim.fn.fnamemodify(cwd_ctx.file, ":h") or nil
 
----Build command with git root directory if configured
----@param config table Plugin configuration
----@param git table Git module
----@param base_cmd string Base command to run
----@return string Command with git root directory change if applicable
-local function build_command_with_git_root(config, git, base_cmd)
-  if config.git and config.git.use_git_root then
-    local git_root = git.get_git_root()
-    if git_root then
-      local quoted_root = vim.fn.shellescape(git_root)
-      local separator = config.shell.separator
-      local pushd_cmd = config.shell.pushd_cmd
-      local popd_cmd = config.shell.popd_cmd
-      return pushd_cmd
-        .. ' '
-        .. quoted_root
-        .. ' '
-        .. separator
-        .. ' '
-        .. base_cmd
-        .. ' '
-        .. separator
-        .. ' '
-        .. popd_cmd
+  local resolved_cwd = nil
+  -- Prefer provider function, then static cwd, then git root via resolver
+  if effective_config.cwd_provider then
+    local ok_p, res = pcall(effective_config.cwd_provider, cwd_ctx)
+    if ok_p and type(res) == "string" and res ~= "" then
+      resolved_cwd = vim.fn.expand(res)
     end
   end
-  return base_cmd
+  if not resolved_cwd and type(effective_config.cwd) == "string" and effective_config.cwd ~= "" then
+    resolved_cwd = vim.fn.expand(effective_config.cwd)
+  end
+  if not resolved_cwd and effective_config.git_repo_cwd then
+    local ok_r, cwd_mod = pcall(require, "cursoragent.cwd")
+    if ok_r and cwd_mod and type(cwd_mod.git_root) == "function" then
+      resolved_cwd = cwd_mod.git_root(cwd_ctx.file_dir or cwd_ctx.cwd)
+    end
+  end
+
+  return {
+    split_side = effective_config.split_side,
+    split_width_percentage = effective_config.split_width_percentage,
+    auto_close = effective_config.auto_close,
+    snacks_win_opts = effective_config.snacks_win_opts,
+    cwd = resolved_cwd,
+  }
 end
 
----Configure window options
----@param win_id number Window ID
----@param config table Plugin configuration
-local function configure_window_options(win_id, config)
-  if config.window.hide_numbers then
-    vim.api.nvim_set_option_value('number', false, {win = win_id})
-    vim.api.nvim_set_option_value('relativenumber', false, {win = win_id})
-  end
-  
-  if config.window.hide_signcolumn then
-    vim.api.nvim_set_option_value('signcolumn', 'no', {win = win_id})
-  end
-end
-
----Generate buffer name for instance
----@param instance_id string Instance identifier
----@param config table Plugin configuration
----@return string Buffer name
-local function generate_buffer_name(instance_id, config)
-  if config.git.multi_instance then
-    return 'cursoragent-' .. instance_id:gsub('[^%w%-_]', '-')
-  else
-    return 'cursoragent'
-  end
-end
-
----Create a split window
----@param position string Window position
----@param config table Plugin configuration
----@param existing_bufnr number|nil Existing buffer number
-local function create_split(position, config, existing_bufnr)
-  -- Handle floating window
-  if position == 'float' then
-    return create_float(config, existing_bufnr)
-  end
-
-  local is_vertical = position:match('vsplit') or position:match('vertical')
-
-  if position:match('split') then
-    vim.cmd(position)
-  else
-    local split_cmd = is_vertical and 'vsplit' or 'split'
-    vim.cmd(position .. ' ' .. split_cmd)
-  end
-
-  if existing_bufnr then
-    vim.cmd('buffer ' .. existing_bufnr)
-  end
-  if is_vertical then
-    vim.cmd('vertical resize ' .. math.floor(vim.o.columns * config.window.split_ratio))
-  else
-    vim.cmd('resize ' .. math.floor(vim.o.lines * config.window.split_ratio))
-  end
-end
-
----Check if buffer is a valid terminal
----@param bufnr number Buffer number
----@return boolean is_valid
-local function is_valid_terminal_buffer(bufnr)
-  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+---Checks if a terminal buffer is currently visible in any window
+---@param bufnr number? The buffer number to check
+---@return boolean True if the buffer is visible in any window, false otherwise
+local function is_terminal_visible(bufnr)
+  if not bufnr then
     return false
   end
-  
-  local buftype = nil
-  pcall(function()
-    buftype = vim.api.nvim_get_option_value('buftype', {buf = bufnr})
-  end)
-  
-  local terminal_job_id = nil
-  pcall(function()
-    terminal_job_id = vim.b[bufnr].terminal_job_id
-  end)
-  
-  return buftype == 'terminal'
-    and terminal_job_id
-    and vim.fn.jobwait({ terminal_job_id }, 0)[1] == -1
+
+  local bufinfo = vim.fn.getbufinfo(bufnr)
+  return bufinfo and #bufinfo > 0 and #bufinfo[1].windows > 0
 end
 
----Handle existing instance (toggle visibility)
----@param bufnr number Buffer number
----@param config table Plugin configuration
-local function handle_existing_instance(bufnr, config)
-  local win_ids = vim.fn.win_findbuf(bufnr)
-  if #win_ids > 0 then
-    for _, win_id in ipairs(win_ids) do
-      vim.api.nvim_win_close(win_id, true)
-    end
+---Gets the cursor-agent command string and necessary environment variables
+---@param cmd_args string? Optional arguments to append to the command
+---@return string cmd_string The command string
+---@return table env_table The environment variables table
+local function get_cursor_agent_command_and_env(cmd_args)
+  -- Inline get_cursor_agent_command logic
+  local cmd_from_config = defaults.terminal_cmd
+  local base_cmd
+  if not cmd_from_config or cmd_from_config == "" then
+    base_cmd = "cursor-agent" -- Default if not configured
   else
-    if config.window.position == 'float' then
-      create_float(config, bufnr)
+    base_cmd = cmd_from_config
+  end
+
+  local cmd_string
+  if cmd_args and cmd_args ~= "" then
+    -- Handle both string and table types for cmd_args
+    if type(cmd_args) == "table" then
+      -- If table, join with spaces
+      cmd_string = base_cmd .. " " .. table.concat(cmd_args, " ")
     else
-      create_split(config.window.position, config, bufnr)
-    end
-    if not config.window.start_in_normal_mode then
-      vim.schedule(function()
-        vim.cmd 'startinsert'
-      end)
-    end
-  end
-end
-
----Create new cursoragent instance
----@param cursor_agent table The main plugin module
----@param config table Plugin configuration
----@param git table Git module
----@param instance_id string Instance identifier
-local function create_new_instance(cursor_agent, config, git, instance_id)
-  if config.window.position == 'float' then
-    local new_bufnr = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_set_option_value('bufhidden', 'hide', {buf = new_bufnr})
-
-    local win_id = create_float(config, new_bufnr)
-    vim.api.nvim_win_set_buf(win_id, new_bufnr)
-
-    local cmd = build_command_with_git_root(config, git, config.command)
-    vim.fn.termopen(cmd)
-
-    local buffer_name = generate_buffer_name(instance_id, config)
-    vim.api.nvim_buf_set_name(new_bufnr, buffer_name)
-
-    configure_window_options(win_id, config)
-    cursor_agent.terminal.instances[instance_id] = new_bufnr
-
-    if config.window.enter_insert and not config.window.start_in_normal_mode then
-      vim.cmd 'startinsert'
+      -- If string, use directly
+      cmd_string = base_cmd .. " " .. cmd_args
     end
   else
-    create_split(config.window.position, config)
-
-    local base_cmd = build_command_with_git_root(config, git, config.command)
-    local cmd = 'terminal ' .. base_cmd
-
-    vim.cmd(cmd)
-    vim.cmd 'setlocal bufhidden=hide'
-
-    local buffer_name = generate_buffer_name(instance_id, config)
-    vim.cmd('file ' .. buffer_name)
-
-    local current_win = vim.api.nvim_get_current_win()
-    configure_window_options(current_win, config)
-
-    cursor_agent.terminal.instances[instance_id] = vim.fn.bufnr('%')
-
-    if config.window.enter_insert and not config.window.start_in_normal_mode then
-      vim.cmd 'startinsert'
-    end
+    cmd_string = base_cmd
   end
+
+  -- Lazy require to avoid circular dependency
+  local server_module = get_server_module()
+  local mcp_port_value = server_module and server_module.state and server_module.state.port or nil
+  local env_table = {
+    ENABLE_IDE_INTEGRATION = "true",
+    FORCE_CODE_TERMINAL = "true",
+  }
+
+  if mcp_port_value then
+    env_table["CURSOR_AGENT_MCP_PORT"] = tostring(mcp_port_value)
+  end
+
+  -- Merge custom environment variables from config
+  for key, value in pairs(defaults.env) do
+    env_table[key] = value
+  end
+
+  return cmd_string, env_table
 end
 
----Toggle cursoragent terminal window
----@param cursor_agent table The main plugin module
----@param config table Plugin configuration
----@param git table Git module
-function M.toggle(cursor_agent, config, git)
-  local instance_id = get_instance_identifier(git, config)
-  cursor_agent.terminal.current_instance = instance_id
-  
-  local bufnr = cursor_agent.terminal.instances[instance_id]
-  
-  if bufnr and not is_valid_terminal_buffer(bufnr) then
-    cursor_agent.terminal.instances[instance_id] = nil
-    bufnr = nil
+---Common helper to open terminal without focus if not already visible
+---@param opts_override table? Optional config overrides
+---@param cmd_args string? Optional command arguments
+---@return boolean visible True if terminal was opened or already visible
+local function ensure_terminal_visible_no_focus(opts_override, cmd_args)
+  local provider = get_provider()
+
+  -- Check if provider has an ensure_visible method
+  if provider.ensure_visible then
+    provider.ensure_visible()
+    return true
   end
-  
-  if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-    handle_existing_instance(bufnr, config)
+
+  local active_bufnr = provider.get_active_bufnr()
+
+  if is_terminal_visible(active_bufnr) then
+    -- Terminal is already visible, do nothing
+    return true
+  end
+
+  -- Terminal is not visible, open it without focus
+  local effective_config = build_config(opts_override)
+  local cmd_string, cursor_agent_env_table = get_cursor_agent_command_and_env(cmd_args)
+
+  provider.open(cmd_string, cursor_agent_env_table, effective_config, false) -- false = don't focus
+  return true
+end
+
+---Configures the terminal module.
+---Merges user-provided terminal configuration with defaults and sets the terminal command.
+---@param user_term_config CursorAgentTerminalConfig? Configuration options for the terminal.
+---@param p_terminal_cmd string? The command to run in the terminal (from main config).
+---@param p_env table? Custom environment variables to pass to the terminal (from main config).
+function M.setup(user_term_config, p_terminal_cmd, p_env)
+  if user_term_config == nil then -- Allow nil, default to empty table silently
+    user_term_config = {}
+  elseif type(user_term_config) ~= "table" then -- Warn if it's not nil AND not a table
+    vim.notify("cursoragent.terminal.setup expects a table or nil for user_term_config", vim.log.levels.WARN)
+    user_term_config = {}
+  end
+
+  if p_terminal_cmd == nil or type(p_terminal_cmd) == "string" then
+    defaults.terminal_cmd = p_terminal_cmd
   else
-    if bufnr and not vim.api.nvim_buf_is_valid(bufnr) then
-      cursor_agent.terminal.instances[instance_id] = nil
-    end
-    create_new_instance(cursor_agent, config, git, instance_id)
+    vim.notify(
+      "cursoragent.terminal.setup: Invalid terminal_cmd provided: " .. tostring(p_terminal_cmd) .. ". Using default.",
+      vim.log.levels.WARN
+    )
+    defaults.terminal_cmd = nil -- Fallback to default behavior
   end
+
+  if p_env == nil or type(p_env) == "table" then
+    defaults.env = p_env or {}
+  else
+    vim.notify(
+      "cursoragent.terminal.setup: Invalid env provided: " .. tostring(p_env) .. ". Using empty table.",
+      vim.log.levels.WARN
+    )
+    defaults.env = {}
+  end
+
+  for k, v in pairs(user_term_config) do
+    if k == "split_side" then
+      if v == "left" or v == "right" then
+        defaults.split_side = v
+      else
+        vim.notify("cursoragent.terminal.setup: Invalid value for split_side: " .. tostring(v), vim.log.levels.WARN)
+      end
+    elseif k == "split_width_percentage" then
+      if type(v) == "number" and v > 0 and v < 1 then
+        defaults.split_width_percentage = v
+      else
+        vim.notify(
+          "cursoragent.terminal.setup: Invalid value for split_width_percentage: " .. tostring(v),
+          vim.log.levels.WARN
+        )
+      end
+    elseif k == "provider" then
+      if type(v) == "table" or v == "snacks" or v == "native" or v == "external" or v == "auto" or v == "none" then
+        defaults.provider = v
+      else
+        vim.notify(
+          "cursoragent.terminal.setup: Invalid value for provider: " .. tostring(v) .. ". Defaulting to 'native'.",
+          vim.log.levels.WARN
+        )
+      end
+    elseif k == "provider_opts" then
+      -- Handle nested provider options
+      if type(v) == "table" then
+        defaults[k] = defaults[k] or {}
+        for opt_k, opt_v in pairs(v) do
+          if opt_k == "external_terminal_cmd" then
+            if opt_v == nil or type(opt_v) == "string" or type(opt_v) == "function" then
+              defaults[k][opt_k] = opt_v
+            else
+              vim.notify(
+                "cursoragent.terminal.setup: Invalid value for provider_opts.external_terminal_cmd: " .. tostring(opt_v),
+                vim.log.levels.WARN
+              )
+            end
+          else
+            -- For other provider options, just copy them
+            defaults[k][opt_k] = opt_v
+    end
+  end
+      else
+        vim.notify("cursoragent.terminal.setup: Invalid value for provider_opts: " .. tostring(v), vim.log.levels.WARN)
+      end
+    elseif k == "show_native_term_exit_tip" then
+      if type(v) == "boolean" then
+        defaults.show_native_term_exit_tip = v
+      else
+        vim.notify(
+          "cursoragent.terminal.setup: Invalid value for show_native_term_exit_tip: " .. tostring(v),
+          vim.log.levels.WARN
+        )
+      end
+    elseif k == "auto_close" then
+      if type(v) == "boolean" then
+        defaults.auto_close = v
+      else
+        vim.notify("cursoragent.terminal.setup: Invalid value for auto_close: " .. tostring(v), vim.log.levels.WARN)
+      end
+    elseif k == "snacks_win_opts" then
+      if type(v) == "table" then
+        defaults.snacks_win_opts = v
+      else
+        vim.notify("cursoragent.terminal.setup: Invalid value for snacks_win_opts", vim.log.levels.WARN)
+      end
+    elseif k == "cwd" then
+      if v == nil or type(v) == "string" then
+        defaults.cwd = v
+      else
+        vim.notify("cursoragent.terminal.setup: Invalid value for cwd: " .. tostring(v), vim.log.levels.WARN)
+      end
+    elseif k == "git_repo_cwd" then
+      if type(v) == "boolean" then
+        defaults.git_repo_cwd = v
+      else
+        vim.notify("cursoragent.terminal.setup: Invalid value for git_repo_cwd: " .. tostring(v), vim.log.levels.WARN)
+      end
+    elseif k == "cwd_provider" then
+      local t = type(v)
+      if t == "function" then
+        defaults.cwd_provider = v
+      elseif t == "table" then
+        local mt = getmetatable(v)
+        if mt and mt.__call then
+          defaults.cwd_provider = v
+        else
+          vim.notify(
+            "cursoragent.terminal.setup: cwd_provider table is not callable (missing __call)",
+            vim.log.levels.WARN
+          )
+        end
+      else
+        vim.notify("cursoragent.terminal.setup: Invalid cwd_provider type: " .. tostring(t), vim.log.levels.WARN)
+    end
+  else
+      if k ~= "terminal_cmd" then
+        vim.notify("cursoragent.terminal.setup: Unknown configuration key: " .. k, vim.log.levels.WARN)
+      end
+    end
+  end
+
+  -- Setup providers with config
+  get_provider().setup(defaults)
 end
 
----Force insert mode when entering cursoragent window
----@param cursor_agent table The main plugin module
----@param config table Plugin configuration
-function M.force_insert_mode(cursor_agent, config)
-  local current_bufnr = vim.fn.bufnr('%')
-  
-  local is_cursor_instance = false
-  for _, bufnr in pairs(cursor_agent.terminal.instances) do
-    if bufnr and bufnr == current_bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-      is_cursor_instance = true
-      break
-    end
+---Opens or focuses the Cursor Agent terminal.
+---@param opts_override table? Overrides for terminal appearance (split_side, split_width_percentage).
+---@param cmd_args string? Arguments to append to the cursor-agent command.
+function M.open(opts_override, cmd_args)
+  local effective_config = build_config(opts_override)
+  local cmd_string, cursor_agent_env_table = get_cursor_agent_command_and_env(cmd_args)
+
+  get_provider().open(cmd_string, cursor_agent_env_table, effective_config)
+end
+
+---Closes the managed Cursor Agent terminal if it's open and valid.
+function M.close()
+  get_provider().close()
+end
+
+---Simple toggle: always show/hide the Cursor Agent terminal regardless of focus.
+---@param opts_override table? Overrides for terminal appearance (split_side, split_width_percentage).
+---@param cmd_args string? Arguments to append to the cursor-agent command.
+function M.simple_toggle(opts_override, cmd_args)
+  local effective_config = build_config(opts_override)
+  local cmd_string, cursor_agent_env_table = get_cursor_agent_command_and_env(cmd_args)
+
+  get_provider().simple_toggle(cmd_string, cursor_agent_env_table, effective_config)
+end
+
+---Smart focus toggle: switches to terminal if not focused, hides if currently focused.
+---@param opts_override table (optional) Overrides for terminal appearance (split_side, split_width_percentage).
+---@param cmd_args string|nil (optional) Arguments to append to the cursor-agent command.
+function M.focus_toggle(opts_override, cmd_args)
+  local effective_config = build_config(opts_override)
+  local cmd_string, cursor_agent_env_table = get_cursor_agent_command_and_env(cmd_args)
+
+  get_provider().focus_toggle(cmd_string, cursor_agent_env_table, effective_config)
+end
+
+---Toggle open terminal without focus if not already visible, otherwise do nothing.
+---@param opts_override table? Overrides for terminal appearance (split_side, split_width_percentage).
+---@param cmd_args string? Arguments to append to the cursor-agent command.
+function M.toggle_open_no_focus(opts_override, cmd_args)
+  ensure_terminal_visible_no_focus(opts_override, cmd_args)
+end
+
+---Ensures terminal is visible without changing focus. Creates if necessary, shows if hidden.
+---@param opts_override table? Overrides for terminal appearance (split_side, split_width_percentage).
+---@param cmd_args string? Arguments to append to the cursor-agent command.
+function M.ensure_visible(opts_override, cmd_args)
+  ensure_terminal_visible_no_focus(opts_override, cmd_args)
+end
+
+---Toggles the Cursor Agent terminal open or closed (legacy function - use simple_toggle or focus_toggle).
+---@param opts_override table? Overrides for terminal appearance (split_side, split_width_percentage).
+---@param cmd_args string? Arguments to append to the cursor-agent command.
+function M.toggle(opts_override, cmd_args)
+  -- Default to simple toggle for backward compatibility
+  M.simple_toggle(opts_override, cmd_args)
+end
+
+---Gets the buffer number of the currently active Cursor Agent terminal.
+---This checks both Snacks and native fallback terminals.
+---@return number|nil The buffer number if an active terminal is found, otherwise nil.
+function M.get_active_terminal_bufnr()
+  return get_provider().get_active_bufnr()
+end
+
+---Gets the managed terminal instance for testing purposes.
+-- NOTE: This function is intended for use in tests to inspect internal state.
+-- The underscore prefix indicates it's not part of the public API for regular use.
+---@return table|nil terminal The managed terminal instance, or nil.
+function M._get_managed_terminal_for_test()
+  local provider = get_provider()
+  if provider and provider._get_terminal_for_test then
+    return provider._get_terminal_for_test()
   end
-  
-  if is_cursor_instance then
-    local mode = vim.api.nvim_get_mode().mode
-    if vim.bo.buftype == 'terminal' and mode ~= 't' and mode ~= 'i' then
-      vim.cmd 'silent! stopinsert'
-      vim.schedule(function()
-        vim.cmd 'silent! startinsert'
-      end)
-    end
-  end
+  return nil
 end
 
 return M
-

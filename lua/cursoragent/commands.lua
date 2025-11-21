@@ -40,20 +40,24 @@ function M.register_commands(cursor_agent)
     cursor_agent.ask({ file = tmp, title = title })
   end, { desc = 'Send current buffer contents to Cursor Agent' })
 
-  for variant_name, variant_args in pairs(cursor_agent.config.command_variants) do
-    if variant_args ~= false then
-      if variant_name == 'agent' then
-        goto continue
-      end
-      
-      local capitalized_name = variant_name:gsub('^%l', string.upper)
-      local cmd_name = 'CursorAgent' .. capitalized_name
+  -- Register variant commands if command_variants exists (backward compatibility)
+  -- Note: In new config structure, variants are handled via terminal.open() with cmd_args
+  if cursor_agent.config and cursor_agent.config.command_variants then
+    for variant_name, variant_args in pairs(cursor_agent.config.command_variants) do
+      if variant_args ~= false then
+        local capitalized_name = variant_name:gsub('^%l', string.upper)
+        local cmd_name = 'CursorAgent' .. capitalized_name
 
-      vim.api.nvim_create_user_command(cmd_name, function()
-        cursor_agent.toggle_with_variant(variant_name)
-      end, { desc = 'Toggle Cursor Agent terminal with ' .. variant_name .. ' option' })
-      
-      ::continue::
+        vim.api.nvim_create_user_command(cmd_name, function()
+          if cursor_agent.toggle_with_variant then
+            cursor_agent.toggle_with_variant(variant_name)
+          else
+            -- Fallback: use terminal.open() with cmd_args
+            local terminal = require("cursoragent.terminal")
+            terminal.open(nil, variant_args)
+          end
+        end, { desc = 'Toggle Cursor Agent terminal with ' .. variant_name .. ' option' })
+      end
     end
   end
 end

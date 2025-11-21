@@ -14,8 +14,14 @@ local refresh_timer = nil
 ---@param cursor_agent table The main plugin module
 ---@param config table The plugin configuration
 function M.setup(cursor_agent, config)
-  if not config.refresh.enable then
+  -- Backward compatibility: check both old and new config structure
+  local refresh_config = config.refresh or {}
+  if refresh_config.enable == false then
     return
+  end
+  -- Default to enabled if not specified
+  if refresh_config.enable == nil then
+    refresh_config.enable = true
   end
 
   local augroup = vim.api.nvim_create_augroup('CursorAgentFileRefresh', { clear = true })
@@ -52,13 +58,14 @@ function M.setup(cursor_agent, config)
   -- Create a timer to check for file changes periodically
   refresh_timer = vim.loop.new_timer()
   if refresh_timer then
+    local timer_interval = refresh_config.timer_interval or 1000
     refresh_timer:start(
       0,
-      config.refresh.timer_interval,
+      timer_interval,
       vim.schedule_wrap(function()
         -- Only check time if there's an active cursoragent terminal
-        local current_instance = cursor_agent.terminal.current_instance
-        local bufnr = current_instance and cursor_agent.terminal.instances[current_instance]
+        local terminal = require("cursoragent.terminal")
+        local bufnr = terminal.get_active_terminal_bufnr and terminal.get_active_terminal_bufnr()
         if bufnr and vim.api.nvim_buf_is_valid(bufnr) and #vim.fn.win_findbuf(bufnr) > 0 then
           vim.cmd 'silent! checktime'
         end
@@ -67,7 +74,7 @@ function M.setup(cursor_agent, config)
   end
 
   -- Create an autocommand that notifies when a file has been changed externally
-  if config.refresh.show_notifications then
+  if refresh_config.show_notifications ~= false then
     vim.api.nvim_create_autocmd('FileChangedShellPost', {
       group = augroup,
       pattern = '*',
@@ -79,7 +86,7 @@ function M.setup(cursor_agent, config)
   end
 
   -- Set a shorter updatetime while cursoragent is open
-  cursor_agent.terminal.saved_updatetime = vim.o.updatetime
+  local saved_updatetime = vim.o.updatetime
 
   -- When cursoragent opens, set a shorter updatetime
   vim.api.nvim_create_autocmd('TermOpen', {
@@ -88,9 +95,9 @@ function M.setup(cursor_agent, config)
     callback = function()
       local buf = vim.api.nvim_get_current_buf()
       local buf_name = vim.api.nvim_buf_get_name(buf)
-      if buf_name:match('cursoragent') then
-        cursor_agent.terminal.saved_updatetime = vim.o.updatetime
-        vim.o.updatetime = config.refresh.updatetime
+      if buf_name:match('cursoragent') or buf_name:match('cursor%-agent') then
+        saved_updatetime = vim.o.updatetime
+        vim.o.updatetime = refresh_config.updatetime or 100
       end
     end,
     desc = 'Set shorter updatetime when cursoragent is open',
@@ -102,9 +109,9 @@ function M.setup(cursor_agent, config)
     pattern = '*',
     callback = function()
       local buf_name = vim.api.nvim_buf_get_name(0)
-      if buf_name:match('cursoragent') then
-        if cursor_agent.terminal.saved_updatetime then
-          vim.o.updatetime = cursor_agent.terminal.saved_updatetime
+      if buf_name:match('cursoragent') or buf_name:match('cursor%-agent') then
+        if saved_updatetime then
+          vim.o.updatetime = saved_updatetime
         end
       end
     end,

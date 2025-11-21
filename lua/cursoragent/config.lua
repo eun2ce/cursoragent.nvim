@@ -1,435 +1,292 @@
+---@brief [[
+--- Manages configuration for the Cursor Agent Neovim integration.
+--- Provides default settings, validation, and application of user-defined configurations.
+---@brief ]]
+---@module 'cursoragent.config'
+
 local M = {}
 
----@class CursorAgentWindowConfig
----@field position string Window position: "float", "botright", "topleft", "vertical", "vsplit"
----@field split_ratio number Ratio for split windows (0-1)
----@field enter_insert boolean Enter insert mode when opening
----@field start_in_normal_mode boolean Whether to start in normal mode instead of insert mode
----@field hide_numbers boolean Hide line numbers
----@field hide_signcolumn boolean Hide sign column
----@field float CursorAgentFloatConfig|nil Floating window config (when position = "float")
-
----@class CursorAgentFloatConfig
----@field width number|string Width (number or percentage like "80%")
----@field height number|string Height (number or percentage like "80%")
----@field row number|string|nil Row position (number, "center", or percentage)
----@field col number|string|nil Column position (number, "center", or percentage)
----@field relative string Relative positioning: "editor" or "cursor"
----@field border string Border style: "none", "single", "double", "rounded", "solid", "shadow"
-
----@class CursorAgentRefreshConfig
----@field enable boolean Enable file change detection
----@field updatetime number updatetime when active (milliseconds)
----@field timer_interval number File check interval (milliseconds)
----@field show_notifications boolean Show notification when files reloaded
-
----@class CursorAgentGitConfig
----@field use_git_root boolean Set CWD to git root when opening
----@field multi_instance boolean Use multiple instances (one per git root)
-
----@class CursorAgentShellConfig
----@field separator string Command separator (e.g., '&&', ';')
----@field pushd_cmd string Command to push directory (e.g., 'pushd')
----@field popd_cmd string Command to pop directory (e.g., 'popd')
-
----@class CursorAgentKeymapsToggle
----@field normal string|boolean Normal mode keymap, false to disable
----@field terminal string|boolean Terminal mode keymap, false to disable
----@field variants table<string, string|boolean>|nil Variant keymaps
-
----@class CursorAgentKeymapsConfig
----@field toggle CursorAgentKeymapsToggle Toggle keymaps
----@field window_navigation boolean Enable window navigation keymaps
----@field scrolling boolean Enable scrolling keymaps
-
----@class CursorAgentConfig
----@field command string Command used to launch Cursor Agent
----@field window CursorAgentWindowConfig Window settings
----@field refresh CursorAgentRefreshConfig File refresh settings
----@field git CursorAgentGitConfig Git integration settings
----@field shell CursorAgentShellConfig Shell-specific settings
----@field command_variants table<string, string|boolean> Command variants (e.g., { resume = "--resume" })
----@field keymaps CursorAgentKeymapsConfig Keymaps configuration
-
-local default_config = {
-  window = {
-    position = "float",
-    split_ratio = 0.3,
-    enter_insert = true,
-    start_in_normal_mode = false,
-    hide_numbers = true,
-    hide_signcolumn = true,
-    float = {
-      width = "80%",
-      height = "80%",
-      row = "center",
-      col = "center",
-      relative = "editor",
-      border = "rounded",
-    },
+---@type CursorAgentConfig
+M.defaults = {
+  port_range = { min = 10000, max = 65535 },
+  auto_start = true,
+  terminal_cmd = nil,
+  env = {}, -- Custom environment variables for Cursor Agent terminal
+  log_level = "info",
+  track_selection = true,
+  -- When true, focus Cursor Agent terminal after a successful send while connected
+  focus_after_send = false,
+  visual_demotion_delay_ms = 50, -- Milliseconds to wait before demoting a visual selection
+  connection_wait_delay = 600, -- Milliseconds to wait after connection before sending queued @ mentions
+  connection_timeout = 10000, -- Maximum time to wait for Cursor Agent to connect (milliseconds)
+  queue_timeout = 5000, -- Maximum time to keep @ mentions in queue (milliseconds)
+  diff_opts = {
+    layout = "vertical",
+    open_in_new_tab = false, -- Open diff in a new tab (false = use current tab)
+    keep_terminal_focus = false, -- If true, moves focus back to terminal after diff opens
+    hide_terminal_in_new_tab = false, -- If true and opening in a new tab, do not show Cursor Agent terminal there
+    on_new_file_reject = "keep_empty", -- "keep_empty" leaves an empty buffer; "close_window" closes the placeholder split
   },
-  
-  refresh = {
-    enable = true,
-    updatetime = 100,
-    timer_interval = 1000,
-    show_notifications = true,
-  },
-  
-  git = {
-    use_git_root = true,
-    multi_instance = true,
-  },
-  
-  shell = {
-    separator = '&&',
-    pushd_cmd = 'pushd',
-    popd_cmd = 'popd',
-  },
-  
-  command = "cursor-agent",
-  command_variants = {
-    ask = "ask",
-    plan = "plan",
-    resume = "--resume",
-  },
-  
-  keymaps = {
-    toggle = {
-      normal = "<leader>ca",
-      terminal = "<leader>ca",
-      variants = {
-        ask = "<leader>cA",
-        plan = "<leader>cP",
-        resume = "<leader>cR",
-      },
-    },
-    window_navigation = true,
-    scrolling = true,
-  },
+  terminal = nil, -- Will be lazy-loaded to avoid circular dependency
 }
 
-local active_config = vim.deepcopy(default_config)
+---Validates the provided configuration table.
+---Throws an error if any validation fails.
+---@param config table The configuration table to validate.
+---@return boolean true if the configuration is valid.
+function M.validate(config)
+  assert(
+    type(config.port_range) == "table"
+      and type(config.port_range.min) == "number"
+      and type(config.port_range.max) == "number"
+      and config.port_range.min > 0
+      and config.port_range.max <= 65535
+      and config.port_range.min <= config.port_range.max,
+    "Invalid port range"
+  )
 
----Validate window configuration
----@param window table
----@return boolean valid
----@return string? error_message
-local function validate_window_config(window)
-  if type(window) ~= 'table' then
-    return false, 'window config must be a table'
-  end
-  
-  if type(window.split_ratio) ~= 'number' or window.split_ratio <= 0 or window.split_ratio > 1 then
-    return false, 'window.split_ratio must be a number between 0 and 1'
-  end
-  
-  if type(window.position) ~= 'string' then
-    return false, 'window.position must be a string'
-  end
-  
-  if type(window.enter_insert) ~= 'boolean' then
-    return false, 'window.enter_insert must be a boolean'
-  end
-  
-  if type(window.start_in_normal_mode) ~= 'boolean' then
-    return false, 'window.start_in_normal_mode must be a boolean'
-  end
-  
-  if type(window.hide_numbers) ~= 'boolean' then
-    return false, 'window.hide_numbers must be a boolean'
-  end
-  
-  if type(window.hide_signcolumn) ~= 'boolean' then
-    return false, 'window.hide_signcolumn must be a boolean'
-  end
-  
-  return true, nil
-end
+  assert(type(config.auto_start) == "boolean", "auto_start must be a boolean")
 
----Validate float configuration
----@param float table
----@return boolean valid
----@return string? error_message
-local function validate_float_config(float)
-  if type(float) ~= 'table' then
-    return false, 'window.float must be a table when position is "float"'
-  end
-  
-  -- Validate width
-  if type(float.width) == 'string' then
-    if not float.width:match('^%d+%%$') then
-      return false, 'window.float.width must be a number or percentage (e.g., "80%")'
+  assert(config.terminal_cmd == nil or type(config.terminal_cmd) == "string", "terminal_cmd must be nil or a string")
+
+  -- Validate terminal config
+  assert(type(config.terminal) == "table", "terminal must be a table")
+
+  -- Validate provider_opts if present
+  if config.terminal.provider_opts then
+    assert(type(config.terminal.provider_opts) == "table", "terminal.provider_opts must be a table")
+
+    -- Validate external_terminal_cmd in provider_opts
+    if config.terminal.provider_opts.external_terminal_cmd then
+      local cmd_type = type(config.terminal.provider_opts.external_terminal_cmd)
+      assert(
+        cmd_type == "string" or cmd_type == "function",
+        "terminal.provider_opts.external_terminal_cmd must be a string or function"
+      )
+      -- Only validate %s placeholder for strings
+      if cmd_type == "string" and config.terminal.provider_opts.external_terminal_cmd ~= "" then
+        assert(
+          config.terminal.provider_opts.external_terminal_cmd:find("%%s"),
+          "terminal.provider_opts.external_terminal_cmd must contain '%s' placeholder for the Cursor Agent command"
+        )
+      end
     end
-  elseif type(float.width) ~= 'number' or float.width <= 0 then
-    return false, 'window.float.width must be a positive number or percentage string'
   end
-  
-  -- Validate height
-  if type(float.height) == 'string' then
-    if not float.height:match('^%d+%%$') then
-      return false, 'window.float.height must be a number or percentage (e.g., "80%")'
-    end
-  elseif type(float.height) ~= 'number' or float.height <= 0 then
-    return false, 'window.float.height must be a positive number or percentage string'
-  end
-  
-  -- Validate relative
-  if float.relative ~= 'editor' and float.relative ~= 'cursor' then
-    return false, 'window.float.relative must be "editor" or "cursor"'
-  end
-  
-  -- Validate border
-  local valid_borders = { 'none', 'single', 'double', 'rounded', 'solid', 'shadow' }
-  local is_valid_border = false
-  for _, border in ipairs(valid_borders) do
-    if float.border == border then
-      is_valid_border = true
+
+  local valid_log_levels = { "trace", "debug", "info", "warn", "error" }
+  local is_valid_log_level = false
+  for _, level in ipairs(valid_log_levels) do
+    if config.log_level == level then
+      is_valid_log_level = true
       break
     end
   end
-  if not is_valid_border and type(float.border) ~= 'table' then
-    return false, 'window.float.border must be one of: none, single, double, rounded, solid, shadow, or an array'
+  assert(is_valid_log_level, "log_level must be one of: " .. table.concat(valid_log_levels, ", "))
+
+  assert(type(config.track_selection) == "boolean", "track_selection must be a boolean")
+  -- Allow absence in direct validate() calls; apply() supplies default
+  if config.focus_after_send ~= nil then
+    assert(type(config.focus_after_send) == "boolean", "focus_after_send must be a boolean")
   end
-  
-  return true, nil
+
+  assert(
+    type(config.visual_demotion_delay_ms) == "number" and config.visual_demotion_delay_ms >= 0,
+    "visual_demotion_delay_ms must be a non-negative number"
+  )
+
+  assert(
+    type(config.connection_wait_delay) == "number" and config.connection_wait_delay >= 0,
+    "connection_wait_delay must be a non-negative number"
+  )
+
+  assert(
+    type(config.connection_timeout) == "number" and config.connection_timeout > 0,
+    "connection_timeout must be a positive number"
+  )
+
+  assert(type(config.queue_timeout) == "number" and config.queue_timeout > 0, "queue_timeout must be a positive number")
+
+  assert(type(config.diff_opts) == "table", "diff_opts must be a table")
+  -- New diff options (optional validation to allow backward compatibility)
+  if config.diff_opts.layout ~= nil then
+    assert(
+      config.diff_opts.layout == "vertical" or config.diff_opts.layout == "horizontal",
+      "diff_opts.layout must be 'vertical' or 'horizontal'"
+    )
+  end
+  if config.diff_opts.open_in_new_tab ~= nil then
+    assert(type(config.diff_opts.open_in_new_tab) == "boolean", "diff_opts.open_in_new_tab must be a boolean")
+  end
+  if config.diff_opts.keep_terminal_focus ~= nil then
+    assert(type(config.diff_opts.keep_terminal_focus) == "boolean", "diff_opts.keep_terminal_focus must be a boolean")
+  end
+  if config.diff_opts.hide_terminal_in_new_tab ~= nil then
+    assert(
+      type(config.diff_opts.hide_terminal_in_new_tab) == "boolean",
+      "diff_opts.hide_terminal_in_new_tab must be a boolean"
+    )
+  end
+  if config.diff_opts.on_new_file_reject ~= nil then
+    assert(
+      type(config.diff_opts.on_new_file_reject) == "string"
+        and (
+          config.diff_opts.on_new_file_reject == "keep_empty" or config.diff_opts.on_new_file_reject == "close_window"
+        ),
+      "diff_opts.on_new_file_reject must be 'keep_empty' or 'close_window'"
+    )
+  end
+
+  -- Legacy diff options (accept if present to avoid breaking old configs)
+  if config.diff_opts.auto_close_on_accept ~= nil then
+    assert(type(config.diff_opts.auto_close_on_accept) == "boolean", "diff_opts.auto_close_on_accept must be a boolean")
+  end
+  if config.diff_opts.show_diff_stats ~= nil then
+    assert(type(config.diff_opts.show_diff_stats) == "boolean", "diff_opts.show_diff_stats must be a boolean")
+  end
+  if config.diff_opts.vertical_split ~= nil then
+    assert(type(config.diff_opts.vertical_split) == "boolean", "diff_opts.vertical_split must be a boolean")
+  end
+  if config.diff_opts.open_in_current_tab ~= nil then
+    assert(type(config.diff_opts.open_in_current_tab) == "boolean", "diff_opts.open_in_current_tab must be a boolean")
+  end
+
+  -- Validate env
+  assert(type(config.env) == "table", "env must be a table")
+  for key, value in pairs(config.env) do
+    assert(type(key) == "string", "env keys must be strings")
+    assert(type(value) == "string", "env values must be strings")
+  end
+
+  return true
 end
 
----Validate refresh configuration
----@param refresh table
----@return boolean valid
----@return string? error_message
-local function validate_refresh_config(refresh)
-  if type(refresh) ~= 'table' then
-    return false, 'refresh config must be a table'
-  end
-  
-  if type(refresh.enable) ~= 'boolean' then
-    return false, 'refresh.enable must be a boolean'
-  end
-  
-  if type(refresh.updatetime) ~= 'number' or refresh.updatetime <= 0 then
-    return false, 'refresh.updatetime must be a positive number'
-  end
-  
-  if type(refresh.timer_interval) ~= 'number' or refresh.timer_interval <= 0 then
-    return false, 'refresh.timer_interval must be a positive number'
-  end
-  
-  if type(refresh.show_notifications) ~= 'boolean' then
-    return false, 'refresh.show_notifications must be a boolean'
-  end
-  
-  return true, nil
-end
+---Applies user configuration on top of default settings and validates the result.
+---Also handles backward compatibility with old config structure.
+---@param user_config table|nil The user-provided configuration table.
+---@return CursorAgentConfig config The final, validated configuration table.
+function M.apply(user_config)
+  local config = vim.deepcopy(M.defaults)
 
----Validate git configuration
----@param git table
----@return boolean valid
----@return string? error_message
-local function validate_git_config(git)
-  if type(git) ~= 'table' then
-    return false, 'git config must be a table'
+  -- Lazy-load terminal defaults to avoid circular dependency
+  if config.terminal == nil then
+    local terminal_ok, terminal_module = pcall(require, "cursoragent.terminal")
+    if terminal_ok and terminal_module.defaults then
+      config.terminal = terminal_module.defaults
+    end
   end
-  
-  if type(git.use_git_root) ~= 'boolean' then
-    return false, 'git.use_git_root must be a boolean'
-  end
-  
-  if type(git.multi_instance) ~= 'boolean' then
-    return false, 'git.multi_instance must be a boolean'
-  end
-  
-  return true, nil
-end
 
----Validate shell configuration
----@param shell table
----@return boolean valid
----@return string? error_message
-local function validate_shell_config(shell)
-  if type(shell) ~= 'table' then
-    return false, 'shell config must be a table'
-  end
-  
-  if type(shell.separator) ~= 'string' then
-    return false, 'shell.separator must be a string'
-  end
-  
-  if type(shell.pushd_cmd) ~= 'string' then
-    return false, 'shell.pushd_cmd must be a string'
-  end
-  
-  if type(shell.popd_cmd) ~= 'string' then
-    return false, 'shell.popd_cmd must be a string'
-  end
-  
-  return true, nil
-end
-
----Validate keymaps configuration
----@param keymaps table
----@return boolean valid
----@return string? error_message
-local function validate_keymaps_config(keymaps)
-  if type(keymaps) ~= 'table' then
-    return false, 'keymaps config must be a table'
-  end
-  
-  if type(keymaps.toggle) ~= 'table' then
-    return false, 'keymaps.toggle must be a table'
-  end
-  
-  if not (keymaps.toggle.normal == false or type(keymaps.toggle.normal) == 'string') then
-    return false, 'keymaps.toggle.normal must be a string or false'
-  end
-  
-  if not (keymaps.toggle.terminal == false or type(keymaps.toggle.terminal) == 'string') then
-    return false, 'keymaps.toggle.terminal must be a string or false'
-  end
-  
-  if keymaps.toggle.variants then
-    if type(keymaps.toggle.variants) ~= 'table' then
-      return false, 'keymaps.toggle.variants must be a table'
+  if user_config then
+    -- Backward compatibility: Convert old config structure to new structure
+    local converted_config = {}
+    
+    -- Convert old mcp.* to top-level fields
+    if user_config.mcp then
+      if user_config.mcp.port_range then
+        converted_config.port_range = user_config.mcp.port_range
+      end
+      if user_config.mcp.auto_start ~= nil then
+        converted_config.auto_start = user_config.mcp.auto_start
+      end
+      if user_config.mcp.log_level then
+        converted_config.log_level = user_config.mcp.log_level
+      end
+      if user_config.mcp.track_selection ~= nil then
+        converted_config.track_selection = user_config.mcp.track_selection
+      end
+      if user_config.mcp.focus_after_send ~= nil then
+        converted_config.focus_after_send = user_config.mcp.focus_after_send
+      end
+      if user_config.mcp.visual_demotion_delay_ms then
+        converted_config.visual_demotion_delay_ms = user_config.mcp.visual_demotion_delay_ms
+      end
+      if user_config.mcp.connection_wait_delay then
+        converted_config.connection_wait_delay = user_config.mcp.connection_wait_delay
+      end
+      if user_config.mcp.connection_timeout then
+        converted_config.connection_timeout = user_config.mcp.connection_timeout
+      end
+      if user_config.mcp.queue_timeout then
+        converted_config.queue_timeout = user_config.mcp.queue_timeout
+      end
+      if user_config.mcp.diff_opts then
+        converted_config.diff_opts = user_config.mcp.diff_opts
+      end
     end
     
-    for variant_name, keymap in pairs(keymaps.toggle.variants) do
-      if not (keymap == false or type(keymap) == 'string') then
-        return false, 'keymaps.toggle.variants.' .. variant_name .. ' must be a string or false'
+    -- Convert old command to terminal_cmd
+    if user_config.command then
+      -- Extract base command (remove subcommands like "ask", "plan", etc.)
+      local cmd = user_config.command
+      -- Remove common subcommands and options
+      cmd = cmd:gsub("%s+ask%s*", " ")
+      cmd = cmd:gsub("%s+plan%s*", " ")
+      cmd = cmd:gsub("%s+agent%s*", " ")
+      cmd = cmd:gsub("%s+%-%-resume%s*", " ")
+      cmd = cmd:gsub("%s+%-%-model%s+%S+%s*", " ")
+      cmd = cmd:trim()
+      if cmd ~= "" then
+        converted_config.terminal_cmd = cmd
+    end
+  end
+  
+    -- Convert old window.* to terminal.*
+    if user_config.window then
+      converted_config.terminal = converted_config.terminal or {}
+      if user_config.window.position then
+        -- Map position to split_side
+        if user_config.window.position:match("right") or user_config.window.position:match("botright") then
+          converted_config.terminal.split_side = "right"
+        elseif user_config.window.position:match("left") or user_config.window.position:match("topleft") then
+          converted_config.terminal.split_side = "left"
+        end
+      end
+      if user_config.window.split_ratio then
+        converted_config.terminal.split_width_percentage = user_config.window.split_ratio
+    end
+  end
+  
+    -- Merge converted config with user config (user config takes precedence)
+    if vim.tbl_deep_extend then
+      config = vim.tbl_deep_extend("force", config, converted_config, user_config)
+    else
+      -- Simple fallback for testing environment
+      for k, v in pairs(converted_config) do
+        if config[k] == nil or type(config[k]) ~= "table" then
+          config[k] = v
+        else
+          for k2, v2 in pairs(v) do
+            config[k][k2] = v2
+          end
+        end
+      end
+      for k, v in pairs(user_config) do
+        if config[k] == nil or type(config[k]) ~= "table" then
+          config[k] = v
+        else
+          for k2, v2 in pairs(v) do
+            config[k][k2] = v2
+          end
+        end
       end
     end
   end
   
-  if type(keymaps.window_navigation) ~= 'boolean' then
-    return false, 'keymaps.window_navigation must be a boolean'
-  end
-  
-  if type(keymaps.scrolling) ~= 'boolean' then
-    return false, 'keymaps.scrolling must be a boolean'
-  end
-  
-  return true, nil
-end
-
----Validate command variants configuration
----@param command_variants table
----@return boolean valid
----@return string? error_message
-local function validate_command_variants_config(command_variants)
-  if type(command_variants) ~= 'table' then
-    return false, 'command_variants config must be a table'
-  end
-  
-  for variant_name, variant_args in pairs(command_variants) do
-    if not (variant_args == false or type(variant_args) == 'string') then
-      return false, 'command_variants.' .. variant_name .. ' must be a string or false'
+  -- Backward compatibility: map legacy diff options to new fields if provided
+  if config.diff_opts then
+    local d = config.diff_opts
+    -- Map vertical_split -> layout (legacy option takes precedence)
+    if type(d.vertical_split) == "boolean" then
+      d.layout = d.vertical_split and "vertical" or "horizontal"
+    end
+    -- Map open_in_current_tab -> open_in_new_tab (legacy option takes precedence)
+    if type(d.open_in_current_tab) == "boolean" then
+      d.open_in_new_tab = not d.open_in_current_tab
     end
   end
-  
-  return true, nil
-end
 
----Validate configuration
----@param config CursorAgentConfig
----@return boolean valid
----@return string? error_message
-local function validate_config(config)
-  -- Validate command
-  if type(config.command) ~= 'string' or config.command == '' then
-    return false, 'command must be a non-empty string'
-  end
-  
-  -- Validate window settings
-  local valid, err = validate_window_config(config.window)
-  if not valid then
-    return false, err
-  end
-  
-  -- Validate float configuration if position is "float"
-  if config.window.position == 'float' then
-    valid, err = validate_float_config(config.window.float)
-    if not valid then
-      return false, err
-    end
-  end
-  
-  -- Validate refresh settings
-  valid, err = validate_refresh_config(config.refresh)
-  if not valid then
-    return false, err
-  end
-  
-  -- Validate git settings
-  valid, err = validate_git_config(config.git)
-  if not valid then
-    return false, err
-  end
-  
-  -- Validate shell settings
-  valid, err = validate_shell_config(config.shell)
-  if not valid then
-    return false, err
-  end
-  
-  -- Validate command variants
-  valid, err = validate_command_variants_config(config.command_variants)
-  if not valid then
-    return false, err
-  end
-  
-  -- Validate keymaps
-  valid, err = validate_keymaps_config(config.keymaps)
-  if not valid then
-    return false, err
-  end
-  
-  -- Cross-validate keymaps with command variants
-  if config.keymaps.toggle.variants then
-    for variant_name, keymap in pairs(config.keymaps.toggle.variants) do
-      if keymap ~= false and not config.command_variants[variant_name] then
-        return false, 'keymaps.toggle.variants.' .. variant_name .. ' has no corresponding command variant'
-      end
-    end
-  end
-  
-  return true, nil
-end
+  M.validate(config)
 
----Setup configuration
----@param user_config? table
----@param silent? boolean Suppress error notifications (for tests)
-function M.setup(user_config, silent)
-  -- Deep merge user config with defaults
-  local config = vim.tbl_deep_extend('force', {}, default_config, user_config or {})
-  
-  -- If position is float and no float config provided, use default
-  if config.window.position == 'float' and not (user_config and user_config.window and user_config.window.float) then
-    config.window.float = vim.deepcopy(default_config.window.float)
-  end
-  
-  local valid, err = validate_config(config)
-  if not valid then
-    if not silent then
-      vim.notify('cursoragent: ' .. err, vim.log.levels.ERROR)
-    end
-    -- Fall back to default config
-    active_config = vim.deepcopy(default_config)
-    return
-  end
-  
-  active_config = config
-end
-
----Get current configuration
----@return CursorAgentConfig
-function M.get()
-  return active_config
-end
-
----Reset to defaults
-function M.reset_to_defaults()
-  active_config = vim.deepcopy(default_config)
+  return config
 end
 
 return M
-

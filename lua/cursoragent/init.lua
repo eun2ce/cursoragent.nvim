@@ -272,9 +272,12 @@ end
 function M.ask(opts)
   opts = opts or {}
   local title = opts.title or 'Cursor Agent'
-  local cfg = config.get()
+  local command = (M.state.config and M.state.config.terminal_cmd) or 'cursor-agent'
+  if not command or command == '' then
+	  command = 'cursor-agent'
+  end
 
-  local argv = vim.split(cfg.command, '%s+', { trimempty = true })
+  local argv = vim.split(command, '%s+', { trimempty = true })
   if not argv or #argv == 0 then
     util.err('Invalid command configured')
     return
